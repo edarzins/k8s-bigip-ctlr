@@ -33,10 +33,9 @@ import urllib
 import pyinotify
 
 from urlparse import urlparse
-from f5_cccl._f5 import CloudBigIP, get_protocol, has_partition, log_sequence
-from f5_cccl.common import extract_partition_and_name, ipv4_to_mac,\
-    list_diff_exclusive, IPV4FormatError, PartitionNameError
 from f5.bigip import ManagementRoot
+from f5_cccl.api import F5CloudServiceManager
+from f5_cccl.exceptions import F5CcclError
 
 log = logging.getLogger(__name__)
 console = logging.StreamHandler()
@@ -44,6 +43,24 @@ console.setFormatter(
     logging.Formatter("[%(asctime)s %(name)s %(levelname)s] %(message)s"))
 root_logger = logging.getLogger()
 root_logger.addHandler(console)
+
+SCHEMA_PATH = "./src/f5-cccl/f5_cccl/schemas/cccl-api-schema.yml"
+
+
+class PartitionNameError(Exception):
+    """Exception type for F5 resource name."""
+
+    def __init__(self, msg):
+        """Create partition name exception object."""
+        Exception.__init__(self, msg)
+
+
+class IPV4FormatError(Exception):
+    """Exception type for improperly formatted IPv4 address."""
+
+    def __init__(self, msg):
+        """Create ipv4 format exception object."""
+        Exception.__init__(self, msg)
 
 
 class ResponseStatusFilter(logging.Filter):
@@ -65,12 +82,93 @@ root_logger.addFilter(ResponseStatusFilter())
 root_logger.addFilter(CertFilter())
 root_logger.addFilter(KeyFilter())
 
+
+def list_diff_exclusive(list1, list2):
+    """Return items found only in list1 or list2."""
+    return list(set(list1) ^ set(list2))
+
+
+def ipv4_to_mac(ip_str):
+    """Convert an IPV4 string to a fake MAC address."""
+    ip = ip_str.split('.')
+    if len(ip) != 4:
+        raise IPV4FormatError('Bad IPv4 address format specified for '
+                              'FDB record: {}'.format(ip_str))
+
+    return "0a:0a:%02x:%02x:%02x:%02x" % (
+        int(ip[0]), int(ip[1]), int(ip[2]), int(ip[3]))
+
+
+def extract_partition_and_name(f5_partition_name):
+    """Separate partition and name components for a Big-IP resource."""
+    parts = f5_partition_name.split('/')
+    count = len(parts)
+    if f5_partition_name[0] == '/' and count == 3:
+        # leading slash
+        partition = parts[1]
+        name = parts[2]
+    elif f5_partition_name[0] != '/' and count == 2:
+        # leading slash missing
+        partition = parts[0]
+        name = parts[1]
+    else:
+        raise PartitionNameError('Bad F5 resource name encountered: '
+                                 '{}'.format(f5_partition_name))
+    return partition, name
+
+
+def log_sequence(prefix, sequence_to_log):
+    """Helper function to log a sequence.
+
+    Dump a sequence to the logger, skip if it is empty
+
+    Args:
+        prefix: The prefix string to describe what's being logged
+        sequence_to_log: The sequence being logged
+    """
+    if sequence_to_log:
+        log.debug(prefix + ': %s', (', '.join(sequence_to_log)))
+
+
+def get_protocol(protocol):
+    """Return the protocol (tcp or udp)."""
+    if str(protocol).lower() == 'tcp':
+        return 'tcp'
+    if str(protocol).lower() == 'http':
+        return 'tcp'
+    if str(protocol).lower() == 'udp':
+        return 'udp'
+    else:
+        return None
+
+
+def has_partition(partitions, app_partition):
+    """Check if the app_partition is one we're responsible for."""
+    # App has no partition specified
+    if not app_partition:
+        return False
+
+    # All partitions / wildcard match
+    if '*' in partitions:
+        return True
+
+    # empty partition only
+    if len(partitions) == 0 and not app_partition:
+        raise Exception("No partitions specified")
+
+    # Contains matching partitions
+    if app_partition in partitions:
+        return True
+
+    return False
+
+
 DEFAULT_LOG_LEVEL = logging.INFO
 DEFAULT_VERIFY_INTERVAL = 30.0
 
 
-class K8sCloudBigIP(CloudBigIP):
-    """K8sCloudBigIP class.
+class K8sCloudServiceManager(F5CloudServiceManager):
+    """K8sCloudServiceManager class.
 
     Generates a configuration for a BigIP based upon the apps/tasks managed
     by services/pods/nodes in Kubernetes.
@@ -80,26 +178,24 @@ class K8sCloudBigIP(CloudBigIP):
       BigIP partition
     - For each backend (task, node, or pod), it creates a pool member and adds
       the member to the pool
-    - If the app has a Marathon Health Monitor configured, create a
-      corresponding health monitor for the BigIP pool member
     - Token-based authentication is used by specifying a token named 'tmos'.
       This will allow non-admin users to use the API (BIG-IP must configure
       the accounts with proper permissions, for either local or remote auth).
 
     Args:
-        hostname: IP address of BIG-IP
-        username: BIG-IP username
-        password: BIG-IP password
-        partitions: List of BIG-IP partitions to manage
+        bigip: ManagementRoot object
+        partition: BIG-IP partition to manage
+        schema_path: Path to the CCCL schema
     """
 
-    def __init__(self, hostname, port, username, password, partitions,
-                 manage_types):
-        """Initialize the K8sCloudBigIP object."""
-        super(K8sCloudBigIP, self).__init__(hostname, port, username,
-                                            password, partitions,
-                                            token="tmos",
-                                            manage_types=manage_types)
+    def __init__(self, bigip, partition, schema_path):  # manage_types):
+        """Initialize the K8sCloudServiceManager object."""
+        super(K8sCloudServiceManager, self).__init__(
+            bigip,
+            partition,
+            prefix="",
+            schema_path=schema_path)
+        # FIXME  manage_types=manage_types)
 
     def _apply_config(self, config):
         """Apply the configuration to the BIG-IP.
@@ -107,10 +203,13 @@ class K8sCloudBigIP(CloudBigIP):
         Args:
             config: BIG-IP config dict
         """
+        incomplete = 0
         if 'ltm' in config:
-            CloudBigIP._apply_config(self, config['ltm'])
+            incomplete = self.apply_config(config['ltm'])
         if 'network' in config:
             self._apply_network_config(config['network'])
+
+        return incomplete
 
     def _apply_network_config(self, config):
         """Apply the network configuration to the BIG-IP.
@@ -155,7 +254,7 @@ class K8sCloudBigIP(CloudBigIP):
             vxlan_name: Name of the vxlan tunnel
         """
         partition, name = extract_partition_and_name(vxlan_name)
-        vxlan_tunnel = self.net.fdb.tunnels.tunnel.load(
+        vxlan_tunnel = self._bigip_proxy._bigip.tm.net.fdb.tunnels.tunnel.load(
             partition=partition, name=urllib.quote(name))
         return vxlan_tunnel
 
@@ -267,7 +366,7 @@ class ConfigError(Exception):
         Exception.__init__(self, msg)
 
 
-def create_config_kubernetes(bigip, config):
+def create_config_kubernetes(cccl, config):
     """Create a BIG-IP configuration from the Kubernetes configuration.
 
     Args:
@@ -278,7 +377,7 @@ def create_config_kubernetes(bigip, config):
     if 'openshift-sdn' in config:
         f5['network'] = create_network_config_kubernetes(config)
     if 'resources' in config and 'virtualServers' in config['resources']:
-        f5['ltm'] = create_ltm_config_kubernetes(bigip, config['resources'])
+        f5['ltm'] = create_ltm_config_kubernetes(cccl, config['resources'])
 
     return f5
 
@@ -306,7 +405,85 @@ def append_ssl_profile(profiles, profName):
                          'name': profile[1]})
 
 
-def create_ltm_config_kubernetes(bigip, config):
+def iapp_build_definition(config, members):
+    """Create a dict that defines the 'variables' and 'tables' for an iApp.
+
+    Args:
+        config: BIG-IP config dict
+    """
+    # Build variable list
+    variables = []
+    for key, value in config['variables'].items():
+        var = {'name': key, 'value': value}
+        variables.append(var)
+
+    # The schema says only one of poolMemberTable or tableName is
+    # valid, so if the user set both it should have already been rejected.
+    # But if not, prefer the new poolMemberTable over tableName.
+    tables = []
+    if 'poolMemberTable' in config:
+        tableConfig = config['poolMemberTable']
+
+        # Construct columnNames array from the 'name' prop of each column
+        columnNames = []
+        for col in tableConfig['columns']:
+            columnNames.append(col['name'])
+
+        # Construct rows array - one row for each node, interpret the
+        # 'kind' or 'value' from the column spec.
+        rows = []
+        for node in members:
+            row = []
+            for i, col in enumerate(tableConfig['columns']):
+                if 'value' in col:
+                    row.append(col['value'])
+                elif 'kind' in col:
+                    if col['kind'] == 'IPAddress':
+                        row.append(str(node['address']))
+                    elif col['kind'] == 'Port':
+                        row.append(str(node['port']))
+                    else:
+                        raise ValueError('Unknown kind "%s"' % col['kind'])
+                else:
+                    raise ValueError('Column %d has neither value nor kind'
+                                     % i)
+            rows.append({'row': row})
+
+        # Done - add the generated pool member table to the set of tables
+        # we're going to configure.
+        tables.append({
+            'name': tableConfig['name'],
+            'columnNames': columnNames,
+            'rows': rows
+        })
+    elif 'tableName' in config:
+        # Before adding the flexible poolMemberTable mode, we only
+        # supported three fixed columns in order, and connection_limit was
+        # hardcoded to 0 ("no limit")
+        rows = []
+        for node in members:
+            rows.append({'row': [str(node['address']),
+                                 str(node['port']), '0']})
+        tables.append({
+            'name': config['tableName'],
+            'columnNames': ['addr', 'port', 'connection_limit'],
+            'rows': rows
+        })
+
+    # Add other tables
+    for key in config['tables']:
+        data = config['tables'][key]
+        table = {'columnNames': data['columns'],
+                 'name': key,
+                 'rows': []}
+        for row in data['rows']:
+            table['rows'].append({'row': row})
+        tables.append(table)
+
+    return {'variables': variables, 'tables': tables}
+
+
+def create_ltm_config_kubernetes(cccl, config):
     """Create a BIG-IP LTM configuration from the Kubernetes configuration.
 
     Args:
@@ -316,24 +493,37 @@ def create_ltm_config_kubernetes(bigip, config):
     configuration['l7Policies'] = config.get('l7Policies', [])
     configuration['monitors'] = config.get('monitors', [])
     configuration['pools'] = []
+    configuration['virtualServers'] = []
+    configuration['iapps'] = []
 
     f5_pools = config.get('pools', [])
     f5_services = {}
 
-    # partitions this script is responsible for:
-    partitions = frozenset(bigip.get_partitions())
+    for policy in configuration['l7Policies']:
+        if policy.get('partition', None) is not None:
+            del policy['partition']
+
+    for mon in configuration['monitors']:
+        if mon.get('protocol', None) is not None:
+            mon['type'] = mon['protocol']
+            del mon['protocol']
+
+        if mon.get('partition', None) is not None:
+            del mon['partition']
+
+        mon['name'] = mon['name'] + '_0_' + mon['type']
 
     svcs = config['virtualServers']
     for svc in svcs:
         vs_partition = svc['partition']
         # Only handle application if it's partition is one that this script
         # is responsible for
-        if not has_partition(partitions, vs_partition):
+        if cccl.get_partition() != vs_partition:
             continue
 
         f5_service = {}
         vs_name = svc['name']
-        f5_service['balance'] = svc.get('balance', '')
+        # f5_service['balance'] = svc.get('balance', '')
 
         policies = svc.get('policies', [])
         profiles = svc.get('profiles', [])
@@ -350,19 +540,63 @@ def create_ltm_config_kubernetes(bigip, config):
             continue
 
         f5_service['name'] = vs_name
-        f5_service['partition'] = vs_partition
+        # f5_service['partition'] = vs_partition
 
         if 'iapp' in svc:
-            f5_service['iapp'] = {'template': svc['iapp'],
-                                  'poolMemberTable':
-                                  svc['iappPoolMemberTable'],
-                                  'variables': svc['iappVariables'],
-                                  'options': svc['iappOptions']}
-            f5_service['iapp']['tables'] = svc.get('iappTables', {})
+            # f5_service['iapp'] = {'template': svc['iapp'],
+            #                       'poolMemberTable':
+            #                       svc['iappPoolMemberTable'],
+            #                       'variables': svc['iappVariables'],
+            #                       'options': svc['iappOptions']}
+            # f5_service['iapp']['tables'] = svc.get('iappTables', {})
+
+            cfg = {'tables': []}
+            for k, v in {'template': 'iapp',
+                         'poolMemberTable': 'iappPoolMemberTable',
+                         'tables': 'iappTables',
+                         'variables': 'iappVariables',
+                         'options': 'iappOptions'}.iteritems():
+                if v in svc:
+                    cfg[k] = svc[v]
+
+            # try:
+            # Decode the tables
+            #    for key in app.iappTables:
+            #        cfg['tables'][key] = json.loads(app.iappTables[key])
+            # except ValueError:
+            #    log.error("IAPP TABLE data is not valid JSON")
+            #    continue
+            try:
+                members = []
+                for pool in f5_pools:
+                    if pool['name'] == f5_service['name']:
+                        if pool['poolMemberAddrs'] is not None:
+                            for member in pool['poolMemberAddrs']:
+                                members.append({
+                                    'address': member.split(':')[0],
+                                    'port': int(member.split(':')[1]),
+                                    'session': 'user-enabled'
+                                })
+
+                # format the variables and tables per the schema
+                iapp_def = iapp_build_definition(cfg, members)
+            except ValueError as e:
+                log.error("Invalid pool-member table data: %s", e)
+                continue
+
+            iapp = {
+                'name': f5_service['name'],
+                'template': cfg['template'],
+                'variables': iapp_def['variables'],
+                'tables': iapp_def['tables'],
+                'options': cfg['options']
+            }
+
+            configuration['iapps'].append(iapp)
         else:
-            f5_service['virtual'] = {}
+            # f5_service['virtual'] = {}
             f5_service['pool'] = {}
-            f5_service['health'] = []
+            # f5_service['health'] = []
 
             # Parse the SSL profile into partition and name
             if 'sslProfile' in svc:
@@ -401,9 +635,9 @@ def create_ltm_config_kubernetes(bigip, config):
                     destination = ("/%s/%s:%d" %
                                    (vs_partition, addr, port))
 
-                f5_service['virtual'].update({
+                f5_service.update({
                     'enabled': True,
-                    'disabled': False,
+                    # 'disabled': False,
                     'ipProtocol': get_protocol(svc['mode']),
                     'destination': destination,
                     'pool': "%s" % (svc['pool']),
@@ -411,21 +645,31 @@ def create_ltm_config_kubernetes(bigip, config):
                     'profiles': profiles,
                     'policies': policies
                 })
-        f5_services.update({vs_name: f5_service})
-    configuration['virtualServers'] = f5_services
+            f5_services.update({vs_name: f5_service})
+
+            if f5_service.get('destination', None) is not None:
+                configuration['virtualServers'].append(f5_service)
+
+    # configuration['virtualServers'] = f5_services
 
     # FIXME(garyr): CCCL presently expects pools slightly differently than
     # we get from the controller, so convert to the expected format here.
     for pool in f5_pools:
         found_svc = False
         new_pool = {}
-        members = {}
+        members = []
         pname = pool['name']
         new_pool['name'] = pname
-        monitors = None
+        new_pool['monitors'] = []
+        # monitors = None
         if 'monitor' in pool and pool['monitor']:
-            monitors = ' and '.join(pool['monitor'])
-        new_pool['monitor'] = monitors
+            # monitors = ' and '.join(pool['monitor'])
+            for mon in pool['monitor']:
+                for monitor in configuration['monitors']:
+                    mm = '/' + cccl.get_partition() + '/' + monitor['name']
+                    if mm.startswith(mon):
+                        new_pool['monitors'].append(monitor['name'])
+        #    new_pool['monitors'] = pool['monitor']
 
         balance = None
         vname = pname.rsplit('_', 1)[0]
@@ -435,24 +679,29 @@ def create_ltm_config_kubernetes(bigip, config):
         elif vname in f5_services:
             if 'balance' in f5_services[vname]:
                 balance = f5_services[vname]['balance']
-        new_pool['loadBalancingMode'] = balance
-        new_pool['partition'] = pool['partition']
+
+        if balance is not None:
+            new_pool['loadBalancingMode'] = balance
+
+        # new_pool['partition'] = pool['partition']
         if pool['name'] in f5_services or vname in f5_services:
             if pool['poolMemberAddrs'] is not None:
                 found_svc = True
                 for member in pool['poolMemberAddrs']:
-                    members.update({member: {
-                        'state': 'user-up',
+                    members.append({
+                        'address': member.split(':')[0],
+                        'port': int(member.split(':')[1]),
                         'session': 'user-enabled'
-                    }})
-            new_pool['members'] = members
-        configuration['pools'].append(new_pool)
+                    })
+                new_pool['members'] = members
+                configuration['pools'].append(new_pool)
         if not found_svc:
             log.info(
                 'Pool "{}" has service "{}", which is empty - '
                 'configuring 0 pool members.'.format(
                     pname, pool['serviceName']))
 
+    log.debug("Service Config: %s", json.dumps(configuration))
     return configuration
 
 
@@ -530,9 +779,9 @@ def _delete_client_ssl_profiles(bigip, config):
 
 
 class ConfigHandler():
-    def __init__(self, config_file, bigip, verify_interval):
+    def __init__(self, config_file, cccls, verify_interval):
         self._config_file = config_file
-        self._bigip = bigip
+        self._cccls = cccls
 
         self._condition = threading.Condition()
         self._thread = threading.Thread(target=self._do_reset)
@@ -609,51 +858,58 @@ class ConfigHandler():
                     # Manually create custom profiles;CCCL doesn't yet do this
                     if 'customProfiles' in config['resources']:
                         for profile in config['resources']['customProfiles']:
-                            _create_client_ssl_profile(self._bigip, profile)
+                            _create_client_ssl_profile(
+                                self._cccls[0]._bigip_proxy, profile)
                             customProfiles = True
 
-                    cfg = create_config_kubernetes(self._bigip, config)
-                    if self._bigip.regenerate_config_f5(cfg):
+                    incomplete = 0
+                    for cccl in self._cccls:
+                        cfg = create_config_kubernetes(cccl, config)
+                        try:
+                            incomplete += cccl._apply_config(cfg)
+                        except F5CcclError as e:
+                            log.error("CCCL Error: %s", e.msg)
+
+                    if incomplete:
                         # Error occurred, perform retries
-                        log.warning(
-                            'regenerate operation failed, restarting')
                         self.handle_backoff()
                     else:
-                        if (self._interval and self._interval.is_running() is
-                                False):
+                        if (self._interval and self._interval.is_running()
+                                is False):
                             self._interval.start()
                         self._backoff_time = 1
                         if self._backoff_timer is not None:
                             self.cleanup_backoff()
 
-                        # Manually delete custom profiles (if needed)
-                        if customProfiles:
-                            _delete_client_ssl_profiles(self._bigip,
-                                                        config['resources'])
+                    # Manually delete custom profiles (if needed)
+                    if customProfiles:
+                        _delete_client_ssl_profiles(
+                            self._cccls[0]._bigip_proxy, config['resources'])
 
-                        perf_enable = os.environ.get('SCALE_PERF_ENABLE')
-                        if perf_enable:  # pragma: no cover
-                            test_data = {}
-                            app_count = 0
-                            backend_count = 0
-                            for service in config['resources'][
-                                    'virtualServers']:
-                                app_count += 1
-                                backends = 0
-                                for pool in config['resources']['pools']:
-                                    if pool['name'] == service['name']:
-                                        backends = len(pool['poolMemberAddrs'])
-                                        break
-                                test_data[service['name']] = backends
-                                backend_count += backends
-                            test_data['Total_Services'] = app_count
-                            test_data['Total_Backends'] = backend_count
-                            test_data['Time'] = time.time()
-                            json_data = json.dumps(test_data)
-                            log.info('SCALE_PERF: Test data: %s', json_data)
+                    perf_enable = os.environ.get('SCALE_PERF_ENABLE')
+                    if perf_enable:  # pragma: no cover
+                        test_data = {}
+                        app_count = 0
+                        backend_count = 0
+                        for service in config['resources']['virtualServers']:
+                            app_count += 1
+                            backends = 0
+                            for pool in config['resources']['pools']:
+                                if pool['name'] == service['name']:
+                                    backends = len(pool['poolMemberAddrs'])
+                                    break
+                            test_data[service['name']] = backends
+                            backend_count += backends
+                        test_data['Total_Services'] = app_count
+                        test_data['Total_Backends'] = backend_count
+                        test_data['Time'] = time.time()
+                        json_data = json.dumps(test_data)
+                        log.info('SCALE_PERF: Test data: %s',
+                                 json_data)
 
                     log.debug('updating tasks finished, took %s seconds',
                               time.time() - start_time)
+
                 except Exception:
                     log.exception('Unexpected error')
                     self.handle_backoff()
@@ -692,13 +948,12 @@ class ConfigHandler():
 
 
 class ConfigWatcher(pyinotify.ProcessEvent):
-    def __init__(self, config_file, bigip, on_change):
+    def __init__(self, config_file, on_change):
         basename = os.path.basename(config_file)
         if not basename or 0 == len(basename):
             raise ConfigError('config_file must be a file path')
 
         self._config_file = config_file
-        self._bigip = bigip
         self._on_change = on_change
 
         self._config_dir = os.path.dirname(self._config_file)
@@ -960,23 +1215,41 @@ def main():
         # FIXME (kenr): Big-IP settings are currently static (we ignore any
         #               changes to these fields in subsequent updates). We
         #               may want to make the changes dynamic in the future.
-        bigip = K8sCloudBigIP(host, port,
-                              config['bigip']['username'],
-                              config['bigip']['password'],
-                              config['bigip']['partitions'],
-                              manage_types=[
-                                  '/tm/ltm/virtual',
-                                  '/tm/ltm/pool',
-                                  '/tm/ltm/monitor',
-                                  '/tm/sys/application/service',
-                                  '/tm/ltm/policy'])
 
-        handler = ConfigHandler(args.config_file, bigip, verify_interval)
+        # BIG-IP to manage
+        bigip = ManagementRoot(
+            host,
+            config['bigip']['username'],
+            config['bigip']['password'],
+            port=port,
+            token="tmos")
+
+        # Management for the BIG-IP partitions
+        cccls = []
+        for partition in config['bigip']['partitions']:
+            cccl = K8sCloudServiceManager(
+                bigip,
+                partition,
+                schema_path=SCHEMA_PATH)
+            cccls.append(cccl)
+
+        # bigip = K8sCloudBigIP(host, port,
+        #                      config['bigip']['username'],
+        #                      config['bigip']['password'],
+        #                      config['bigip']['partitions'],
+        #                      manage_types=[
+        #                          '/tm/ltm/virtual',
+        #                          '/tm/ltm/pool',
+        #                          '/tm/ltm/monitor',
+        #                          '/tm/sys/application/service',
+        #                          '/tm/ltm/policy'])
+
+        handler = ConfigHandler(args.config_file, cccls, verify_interval)
 
         if os.path.exists(args.config_file):
             handler.notify_reset()
 
-        watcher = ConfigWatcher(args.config_file, bigip, handler.notify_reset)
+        watcher = ConfigWatcher(args.config_file, handler.notify_reset)
         watcher.loop()
         handler.stop()
     except (IOError, ValueError, ConfigError) as e:
