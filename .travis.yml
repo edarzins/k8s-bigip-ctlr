@@ -27,7 +27,6 @@ script:
   - export CLEAN_BUILD=true
   - export BASE_OS=alpine
   - make verify
-  - make debug
   - make prod
   - docker tag "$IMG_TAG" "$BASE_PUSH_TARGET:devel-$TRAVIS_BRANCH"
   - docker tag "$IMG_TAG" "$BASE_PUSH_TARGET:devel-$TRAVIS_BRANCH-n-$TRAVIS_BUILD_NUMBER-id-$TRAVIS_BUILD_ID"
