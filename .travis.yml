@@ -33,6 +33,7 @@ script:
   - docker tag "$IMG_TAG" "$BASE_PUSH_TARGET:devel-$TRAVIS_BRANCH"
   - docker tag "$IMG_TAG" "$BASE_PUSH_TARGET:devel-$TRAVIS_BRANCH-n-$TRAVIS_BUILD_NUMBER-id-$TRAVIS_BUILD_ID"
   - if [ "$TRAVIS_TAG" == "$TRAVIS_BRANCH" ]; then $BUILD_VERSION=$TRAVIS_TAG; fi
+  - |
     if [ "$DOCKER_READY" ]; then
       docker tag "$IMG_TAG" "$BASE_PUSH_TARGET"
       docker tag "$IMG_TAG" "$BASE_PUSH_TARGET:devel-$TRAVIS_BRANCH"
