@@ -83,7 +83,7 @@ v = semver.parse(f.readline())
 # The short X.Y version.
 version = u'v{}.{}'.format(v['major'], v['minor'])
 # The full version, including alpha/beta/rc tags.
-release = u'v{}.{}.{}-dev'.format((v['major'], v['minor'], v['patch']) 
+release = u'v{}.{}.{}-dev'.format(v['major'], v['minor'], v['patch']) 
 
 # def setup(app):
 #    app.add_config_value('versionlevel', '', 'env')
