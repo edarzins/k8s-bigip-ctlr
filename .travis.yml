@@ -32,13 +32,14 @@ script:
   - docker tag "$IMG_TAG" "$BASE_PUSH_TARGET:devel-$TRAVIS_BRANCH-n-$TRAVIS_BUILD_NUMBER-id-$TRAVIS_BUILD_ID"
   - |
     if [ "$DOCKER_READY" ]; then
-      echo "$BASE_PUSH_TARGET"
       docker tag "$IMG_TAG" "$BASE_PUSH_TARGET"
       docker tag "$IMG_TAG" "$BASE_PUSH_TARGET:devel-$TRAVIS_BRANCH"
       docker tag "$IMG_TAG" "$BASE_PUSH_TARGET:$BUILD_STAMP"
       docker push "$IMG_TAG"
       docker push "$BASE_PUSH_TARGET:devel-$TRAVIS_BRANCH"
       docker push "$BASE_PUSH_TARGET:$BUILD_STAMP"
+      docker push "$BASE_PUSH_TARGET:$BUILD_VERSION"
+      docker push "$BASE_PUSH_TARGET:$BUILD_VERSION-$BUILD-INFO"
       docker push "$BASE_PUSH_TARGET:latest"
     fi
   - make docs
