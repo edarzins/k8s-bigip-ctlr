@@ -214,7 +214,7 @@ class VersionInfo(object):
         datestr = datetime.now().strftime('%Y%m%d%H%M%S')
         ci_info = self._ci_info()
         if ci_info:
-            return "{slug}-n{build_num}-{build_id}".format(**ci_info)
+            return "n{build_num}-{build_id}".format(**ci_info)
         else:
             # This is a developer build
             return "{}-{}-{}".format(
