@@ -30,6 +30,8 @@ script:
   - export BASE_OS=alpine
   - make verify
   - make prod
+  - echo "version ${BUILD_VERSION}"
+  - echo "info ${BUILD_INFO}"
   - docker tag "$IMG_TAG" "$BASE_PUSH_TARGET:devel-$TRAVIS_BRANCH"
   - docker tag "$IMG_TAG" "$BASE_PUSH_TARGET:devel-$TRAVIS_BRANCH-n-$TRAVIS_BUILD_NUMBER-id-$TRAVIS_BUILD_ID"
   - |
