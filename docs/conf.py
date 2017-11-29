@@ -19,7 +19,6 @@
 #
 import os
 import sys
-import semver
 
 sys.path.insert(0, os.path.abspath('.'))
 sys.path.insert(0, os.path.abspath('../'))
@@ -79,11 +78,11 @@ author = u'F5 Networks'
 # built documents.
 #
 f = open('../next-version.txt')
-v = semver.parse(f.readline())
+v = f.readline().split('.')
 # The short X.Y version.
-version = u'v{}.{}'.format(v['major'], v['minor'])
+version = u'v{}.{}'.format(v[0], v[1])
 # The full version, including alpha/beta/rc tags.
-release = u'v{}.{}.{}-dev'.format(v['major'], v['minor'], v['patch']) 
+release = u'v{}.{}.{}-dev'.format(v[0], v[1], v[2]) 
 
 # def setup(app):
 #    app.add_config_value('versionlevel', '', 'env')
